@@ -36,7 +36,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <application
-        android:label="instant_messenger"
+        android:label="Instant Messenger"
         android:name="${applicationName}"
         android:icon="@mipmap/launcher_icon">
 
