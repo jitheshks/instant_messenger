@@ -1,0 +1,200 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /* =========================
+       COMMON HELPERS
+    ========================= */
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function chatDoc(chatId) {
+      return get(/databases/$(database)/documents/chats/$(chatId));
+    }
+
+ function isMember(chatId) {
+  return signedIn()
+    && (
+      // Normal case
+      (
+        exists(/databases/$(database)/documents/chats/$(chatId))
+        && get(/databases/$(database)/documents/chats/$(chatId))
+            .data.members.hasAny([request.auth.uid])
+      )
+      ||
+      // Bootstrap case (chatId = uidA_uidB)
+      chatId.split("_").hasAny([request.auth.uid])
+    );
+}
+
+
+    function isAdmin(chatId) {
+      return isMember(chatId)
+        && chatDoc(chatId).data.roles[request.auth.uid] == "admin";
+    }
+
+    /* =========================
+       USERS COLLECTION
+    ========================= */
+
+    match /users/{uid} {
+
+      // 🔒 User profile (name, avatar, etc.)
+      allow read: if signedIn();
+      allow write: if signedIn() && request.auth.uid == uid;
+
+      /* -------------------------
+         USER CHAT SUMMARIES
+         Path: /users/{uid}/chats/{chatId}
+      ------------------------- */
+      match /chats/{chatId} {
+        // Needed for list, orderBy, realtime updates
+        allow read: if signedIn();
+
+        // Needed for batch updates & deletes
+        allow write: if signedIn();
+      }
+    }
+
+    /* =========================
+       ONESIGNAL PLAYER IDS
+       ✅ THIS MUST BE OUTSIDE /users/{uid}
+       Path: /users/{uid}/players/{playerId}
+    ========================= */
+
+    match /users/{uid}/players/{playerId} {
+
+      // 🔓 Allow any signed-in user to READ player IDs
+      // (needed to send push notifications)
+      allow read: if signedIn();
+
+      // 🔒 Only the owner can WRITE their own player ID
+      allow write: if signedIn()
+        && request.auth.uid == uid;
+    }
+
+    /* =========================
+       CHATS COLLECTION
+       Path: /chats/{chatId}
+    ========================= */
+
+    match /chats/{chatId} {
+
+      /* ---- Create chat ---- */
+      allow create: if signedIn()
+        && request.resource.data.members is list
+        && request.resource.data.members.size() >= 2
+        && request.resource.data.members.size() <= 50
+        && request.auth.uid in request.resource.data.members;
+
+      /* ---- Read chat ---- */
+      allow read: if signedIn()
+        && (
+          // Existing chat
+          resource.data.members.hasAny([request.auth.uid])
+          ||
+          // First open before chat doc exists
+          request.auth.uid in chatId.split("_")
+        );
+
+      /* ---- Update chat metadata ----
+         ✅ SAFE
+         ✅ Allows lastMessage, unread, muted, lastTime
+         ❌ Blocks members & roles modification
+      -------------------------------- */
+      allow update: if signedIn()
+        && isMember(chatId)
+        && !request.resource.data.diff(resource.data)
+             .affectedKeys()
+             .hasAny(["members", "roles"]);
+
+      /* ---- Delete chat ---- */
+      allow delete: if isAdmin(chatId);
+
+      /* =========================
+         MESSAGES SUBCOLLECTION
+         Path: /chats/{chatId}/messages/{messageId}
+      ========================= */
+
+      match /messages/{messageId} {
+
+        // Read messages
+        allow read: if isMember(chatId);
+
+        // Send message
+        allow create: if isMember(chatId)
+          && request.resource.data.senderId == request.auth.uid
+&& (
+  request.resource.data.sentAt is timestamp
+  || request.resource.data.sentAt == request.time
+)
+          && (
+            request.resource.data.type == "text"
+            || request.resource.data.type == "media"
+            || request.resource.data.type == "call"
+          );
+
+        // Update message (status only or sender edit)
+        allow update: if isMember(chatId)
+          && (
+            request.auth.uid == resource.data.senderId
+            ||
+            request.resource.data.diff(resource.data)
+              .affectedKeys()
+              .hasOnly(["status"])
+          );
+
+        // No deletes
+        allow delete: if false;
+      }
+    }
+
+    /* =========================
+       TYPING INDICATOR
+       Path: /typing/{chatId}/users/{uid}
+    ========================= */
+
+    match /typing/{chatId}/users/{uid} {
+
+      // Members can see typing state
+      allow read: if signedIn()
+        && isMember(chatId);
+
+      // User updates ONLY their own typing state
+      allow create, update: if signedIn()
+        && request.auth.uid == uid
+        && isMember(chatId)
+        && request.resource.data.keys().hasOnly([
+          "typing",
+          "updatedAt"
+        ])
+        && request.resource.data.updatedAt is timestamp;
+
+      // Cleanup
+      allow delete: if signedIn()
+        && request.auth.uid == uid;
+    }
+
+    /* =========================
+       STATUS (OPTIONAL)
+    ========================= */
+
+    match /status/{statusId} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid;
+      allow delete: if signedIn()
+        && resource.data.uid == request.auth.uid;
+    }
+
+    /* =========================
+       DEFAULT DENY
+    ========================= */
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
