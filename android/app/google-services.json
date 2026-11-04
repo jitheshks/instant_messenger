@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "78199300774",
+    "firebase_url": "https://instant-messenger-6a6ce-default-rtdb.firebaseio.com",
+    "project_id": "instant-messenger-6a6ce",
+    "storage_bucket": "instant-messenger-6a6ce.appspot.com"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:78199300774:android:4fba60573f104fe584ca67",
+        "android_client_info": {
+          "package_name": "com.example.instant_messenger"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC1zoE8vC3PX6K7nxD2EKoaW5n45LxWpVc"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

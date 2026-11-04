@@ -15,7 +15,7 @@ void main() {
           .toList()
         ..sort((a, b) => a.path.compareTo(b.path));
 
-      expect(files.length, inInclusiveRange(6, 7), reason: 'Expected 6 to 7 migration files');
+      expect(files.length, inInclusiveRange(6, 12), reason: 'Expected 6 to 12 migration files');
 
       final namingRegex = RegExp(r'^\d{14}_[a-z0-9_]+\.sql$');
       for (final file in files) {
@@ -255,9 +255,113 @@ void main() {
       expect(sql.contains('if v_consumed_tokens = 0 then'), isTrue);
       expect(sql.contains('select exists'), isFalse, reason: 'Race-prone separate SELECT EXISTS check must be removed');
 
+      // Authorization & idempotency validation (Issue 1 & Issue 2 fixes)
+      expect(sql.contains('if v_updated_count = 0 then'), isTrue);
+      expect(sql.contains('m.status >= 2'), isTrue);
+      expect(sql.contains('public.is_chat_member(c.id)'), isTrue);
+      expect(sql.contains('and m.status = 2'), isTrue);
+
       expect(sql.contains('create or replace function public.cleanup_expired_delivery_tokens'), isTrue);
       expect(sql.contains('grant execute on function public.cleanup_expired_delivery_tokens() to service_role;'), isTrue);
       expect(sql.contains('revoke all on function public.cleanup_expired_delivery_tokens() from public, anon, authenticated;'), isTrue);
+    });
+
+    test('Step 8 (20261102000001_calling_schema_and_lifecycle_rpcs.sql) declares calling schema, non-recursive RLS, and lifecycle RPCs', () {
+      final file = File('supabase/migrations/20261102000001_calling_schema_and_lifecycle_rpcs.sql');
+      expect(file.existsSync(), isTrue);
+      final sql = file.readAsStringSync().toLowerCase();
+
+      // Tables & constraints
+      expect(sql.contains('create table if not exists public.calls'), isTrue);
+      expect(sql.contains('create table if not exists public.call_participants'), isTrue);
+      expect(sql.contains('create table if not exists public.call_outbox'), isTrue);
+      expect(sql.contains('constraint uq_calls_room_id unique (room_id)'), isTrue);
+      expect(sql.contains('constraint uq_call_participant unique (call_id, user_id)'), isTrue);
+      expect(sql.contains('constraint uq_outbox_dedup_key unique (dedup_key)'), isTrue);
+
+      // Partial unique index & claiming index
+      expect(sql.contains('create unique index if not exists uq_calls_active_chat'), isTrue);
+      expect(sql.contains("where status in ('ringing', 'ongoing')"), isTrue);
+      expect(sql.contains('create index if not exists idx_call_outbox_claim'), isTrue);
+
+      // Security definer recursion-breaking helpers
+      expect(sql.contains('create or replace function public.is_call_participant'), isTrue);
+      expect(sql.contains('create or replace function public.is_call_caller'), isTrue);
+      expect(sql.contains("set search_path = ''"), isTrue);
+
+      // RLS and least-privilege table grants
+      expect(sql.contains('alter table public.calls enable row level security;'), isTrue);
+      expect(sql.contains('alter table public.call_participants enable row level security;'), isTrue);
+      expect(sql.contains('alter table public.call_outbox enable row level security;'), isTrue);
+      expect(sql.contains('revoke all on public.calls from public, anon, authenticated;'), isTrue);
+      expect(sql.contains('grant select on public.calls to authenticated;'), isTrue);
+
+      // RPC functions
+      final expectedRpcs = [
+        'initiate_call',
+        'accept_call',
+        'reject_call',
+        'cancel_call',
+        'leave_call',
+        'invite_to_call',
+        'rejoin_call',
+        'timeout_call',
+        'claim_call_outbox_events',
+        'process_call_timeouts',
+      ];
+      for (final rpc in expectedRpcs) {
+        expect(sql.contains('function public.$rpc'), isTrue, reason: 'Expected RPC $rpc');
+      }
+
+      // Restricted worker functions
+      expect(sql.contains('grant execute on function public.timeout_call(uuid) to service_role;'), isTrue);
+      expect(sql.contains('grant execute on function public.claim_call_outbox_events(text, integer, integer) to service_role;'), isTrue);
+      expect(sql.contains('grant execute on function public.process_call_timeouts(integer) to service_role;'), isTrue);
+    });
+
+    test('Step 9 (20261102000002_calling_initiate_inline_timeout.sql) adds inline timeout handling to initiate_call', () {
+      final file = File('supabase/migrations/20261102000002_calling_initiate_inline_timeout.sql');
+      expect(file.existsSync(), isTrue);
+      final sql = file.readAsStringSync();
+
+      expect(sql.toLowerCase().contains('create or replace function public.initiate_call'), isTrue);
+      expect(sql.contains("status = 'ringing'"), isTrue);
+      expect(sql.contains("interval '45 seconds'"), isTrue);
+      expect(sql.contains("status = 'missed'"), isTrue);
+      expect(sql.contains("ON CONFLICT (chat_id) WHERE status IN ('ringing', 'ongoing')"), isTrue);
+      expect(sql.contains("SET search_path = ''") || sql.contains("set search_path = ''"), isTrue);
+      expect(sql.toLowerCase().contains('revoke all on function public.initiate_call(uuid, text, uuid[]) from public, anon;'), isTrue);
+      expect(sql.toLowerCase().contains('grant execute on function public.initiate_call(uuid, text, uuid[]) to authenticated;'), isTrue);
+    });
+
+    test('Step 10 (20261104000001_calling_participant_heartbeat_and_liveness.sql) adds app_settings rollout gate, heartbeat RPC, and safe timeout handling', () {
+      final file = File('supabase/migrations/20261104000001_calling_participant_heartbeat_and_liveness.sql');
+      expect(file.existsSync(), isTrue);
+      final sql = file.readAsStringSync().toLowerCase();
+
+      expect(sql.contains('create table if not exists public.app_settings'), isTrue);
+      expect(sql.contains('calling_heartbeat_recovery_enabled'), isTrue);
+      expect(sql.contains('create or replace function public.is_feature_enabled'), isTrue);
+      expect(sql.contains('create or replace function public.heartbeat_call'), isTrue);
+      expect(sql.contains('process_call_timeouts'), isTrue);
+      expect(sql.contains('last_heartbeat_at'), isTrue);
+      expect(sql.contains("set search_path = ''"), isTrue);
+      expect(sql.contains('revoke all on public.app_settings from public, anon, authenticated;'), isTrue);
+      expect(sql.contains('grant select on public.app_settings to authenticated, anon;'), isTrue);
+      expect(sql.contains('grant all on public.app_settings to service_role;'), isTrue);
+    });
+
+    test('Step 11 (20261104000002_harden_app_settings_least_privilege.sql) enforces strict least privilege on app_settings', () {
+      final file = File('supabase/migrations/20261104000002_harden_app_settings_least_privilege.sql');
+      expect(file.existsSync(), isTrue);
+      final sql = file.readAsStringSync().toLowerCase();
+
+      expect(sql.contains('revoke all on table public.app_settings from public, anon, authenticated;'), isTrue);
+      expect(sql.contains('drop policy if exists "app_settings_read" on public.app_settings;'), isTrue);
+      expect(sql.contains('alter table public.app_settings enable row level security;'), isTrue);
+      expect(sql.contains('grant all on table public.app_settings to service_role;'), isTrue);
+      expect(sql.contains('grant execute on function public.is_feature_enabled(text) to authenticated, anon, service_role;'), isTrue);
+      expect(sql.contains('grant select on table public.app_settings to authenticated, anon;'), isFalse);
     });
 
     test('Zero hardcoded credentials or secrets in SQL migration files', () {

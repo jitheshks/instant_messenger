@@ -191,7 +191,7 @@ export function deriveNotificationContent(
 export interface HandlerDeps {
   userClient?: {
     auth: {
-      getUser: (jwt?: string) => Promise<{ data: { user: { id: string } | null }; error: unknown }>;
+      getUser: (jwt?: string) => Promise<{ data: { user: { id: string; phone?: string } | null }; error: unknown }>;
     };
   };
   adminClient?: {
@@ -200,6 +200,7 @@ export interface HandlerDeps {
   };
   rateLimiter?: (client: any, userId: string) => Promise<RateLimitCheckResult>;
   fetcher?: typeof fetch;
+  callWorkerSecret?: string;
 }
 
 /// Helper function to detect whether an identifier is a raw FCM token.
@@ -217,6 +218,458 @@ export function isValidOneSignalSubscriptionId(id: unknown): id is string {
   const trimmed = id.trim();
   if (trimmed.length === 0) return false;
   return UUID_REGEX.test(trimmed);
+}
+
+export interface HandleCallPushOptions {
+  body: Record<string, unknown>;
+  callerId: string;
+  adminClient: any;
+  onesignalAppId?: string;
+  onesignalRestKey?: string;
+  fetcher: typeof fetch;
+}
+
+/// Dispatches call push notifications and manages the transactional outbox
+export async function handleCallPush(options: HandleCallPushOptions): Promise<Response> {
+  const { body, callerId, adminClient, onesignalAppId, onesignalRestKey, fetcher } = options;
+
+  // Branch 1: Server-Side Scheduled Timeout Worker
+  if (body.action === "process_call_timeouts") {
+    const batchSize = typeof body.batch_size === "number" ? Math.min(100, Math.max(1, body.batch_size)) : 25;
+    const { data, error } = await adminClient.rpc("process_call_timeouts", {
+      p_batch_size: batchSize,
+    });
+
+    if (error) {
+      console.error(`[send-push] process_call_timeouts RPC error: ${error.message}`);
+      return new Response(
+        JSON.stringify({ error: "Failed to process call timeouts", details: error.message }),
+        { status: 500, headers: corsHeaders },
+      );
+    }
+
+    return new Response(
+      JSON.stringify({ success: true, action: "process_call_timeouts", processed: data }),
+      { status: 200, headers: corsHeaders },
+    );
+  }
+
+  // Helper to deliver a single outbox event to OneSignal
+  const deliverOutboxEvent = async (outboxRow: any): Promise<boolean> => {
+    try {
+      const payload = typeof outboxRow.payload === "string" ? JSON.parse(outboxRow.payload) : outboxRow.payload;
+      const eventType = outboxRow.event_type;
+
+      if (eventType === "call_invitation") {
+        // Assert call is still in ringing or ongoing status
+        const { data: callRow } = await adminClient
+          .from("calls")
+          .select("id, status")
+          .eq("id", payload.callId)
+          .maybeSingle();
+
+        if (!callRow || !["ringing", "ongoing"].includes(callRow.status)) {
+          // Call ended/cancelled/missed: skip dispatching stale alert
+          await adminClient
+            .from("call_outbox")
+            .update({
+              status: "dispatched",
+              last_error: `skipped: call status is ${callRow?.status ?? "unknown"}`,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", outboxRow.id);
+          return true;
+        }
+
+        const inviteeIds: string[] = Array.isArray(payload.inviteeIds) ? payload.inviteeIds : [];
+        if (inviteeIds.length === 0) {
+          await adminClient
+            .from("call_outbox")
+            .update({
+              status: "dispatched",
+              last_error: "skipped: no inviteeIds",
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", outboxRow.id);
+          return true;
+        }
+
+        // Query active devices for invitees
+        const { data: devices } = await adminClient
+          .from("user_devices")
+          .select("player_id, user_id, platform")
+          .in("user_id", inviteeIds)
+          .eq("subscribed", true);
+
+        const validIds = (devices || [])
+          .map((d: any) => (typeof d.player_id === "string" ? d.player_id.trim() : ""))
+          .filter((id: string) => isValidOneSignalSubscriptionId(id));
+        const uniqueIds = [...new Set(validIds)];
+
+        if (uniqueIds.length === 0) {
+          await adminClient
+            .from("call_outbox")
+            .update({
+              status: "dispatched",
+              last_error: "no_valid_onesignal_subscriptions",
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", outboxRow.id);
+          return true;
+        }
+
+        const isVideo = payload.callType === "video";
+        const heading = (payload.callerName && typeof payload.callerName === "string" && payload.callerName.trim().length > 0)
+          ? payload.callerName.trim()
+          : "Incoming Call";
+        const content = isVideo ? "📹 Incoming Video Call" : "📞 Incoming Voice Call";
+
+        // OneSignal payload — STRICT PRIVACY: room_id is NEVER included!
+        const osPayload = {
+          app_id: onesignalAppId ?? "dummy-app-id",
+          include_subscription_ids: uniqueIds,
+          headings: { en: heading },
+          contents: { en: content },
+          data: {
+            callId: payload.callId,
+            chatId: payload.chatId,
+            callerId: payload.callerId,
+            callerName: payload.callerName,
+            callType: payload.callType,
+            type: "call",
+          },
+          existing_android_channel_id: "calls",
+          priority: 10,
+          collapse_id: payload.callId,
+        };
+
+        const cleanRestKey = (onesignalRestKey ?? "dummy-key").trim().replace(/^(Key|Basic)\s+/i, "");
+        const osRes = await fetcher("https://api.onesignal.com/notifications", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json; charset=UTF-8",
+            Authorization: `Key ${cleanRestKey}`,
+          },
+          body: JSON.stringify(osPayload),
+          signal: AbortSignal.timeout(8000),
+        });
+
+        if (!osRes.ok) {
+          const errBody = await osRes.text().catch(() => "unknown");
+          const sanitized = errBody.length > 250 ? errBody.slice(0, 250) : errBody;
+          await adminClient
+            .from("call_outbox")
+            .update({
+              status: "failed",
+              last_error: `OneSignal HTTP ${osRes.status}: ${sanitized}`,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", outboxRow.id);
+          return false;
+        }
+
+        await adminClient
+          .from("call_outbox")
+          .update({
+            status: "dispatched",
+            dispatched_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", outboxRow.id);
+        return true;
+      } else if (eventType === "call_cancelled") {
+        // Query invitees
+        const { data: participants } = await adminClient
+          .from("call_participants")
+          .select("user_id")
+          .eq("call_id", payload.callId)
+          .neq("user_id", payload.callerId);
+
+        const inviteeUserIds = (participants || []).map((p: any) => p.user_id);
+        if (inviteeUserIds.length === 0) {
+          await adminClient
+            .from("call_outbox")
+            .update({
+              status: "dispatched",
+              last_error: "no_other_participants_to_cancel",
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", outboxRow.id);
+          return true;
+        }
+
+        const { data: devices } = await adminClient
+          .from("user_devices")
+          .select("player_id, user_id, platform")
+          .in("user_id", inviteeUserIds)
+          .eq("subscribed", true);
+
+        const validIds = (devices || [])
+          .map((d: any) => (typeof d.player_id === "string" ? d.player_id.trim() : ""))
+          .filter((id: string) => isValidOneSignalSubscriptionId(id));
+        const uniqueIds = [...new Set(validIds)];
+
+        if (uniqueIds.length === 0) {
+          await adminClient
+            .from("call_outbox")
+            .update({
+              status: "dispatched",
+              last_error: "no_valid_onesignal_subscriptions",
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", outboxRow.id);
+          return true;
+        }
+
+        const osPayload = {
+          app_id: onesignalAppId ?? "dummy-app-id",
+          include_subscription_ids: uniqueIds,
+          headings: { en: "Call Cancelled" },
+          contents: { en: "The call has ended." },
+          data: {
+            callId: payload.callId,
+            chatId: payload.chatId,
+            type: "call_cancelled",
+          },
+          existing_android_channel_id: "calls",
+          priority: 10,
+          collapse_id: payload.callId,
+        };
+
+        const cleanRestKey = (onesignalRestKey ?? "dummy-key").trim().replace(/^(Key|Basic)\s+/i, "");
+        const osRes = await fetcher("https://api.onesignal.com/notifications", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json; charset=UTF-8",
+            Authorization: `Key ${cleanRestKey}`,
+          },
+          body: JSON.stringify(osPayload),
+          signal: AbortSignal.timeout(8000),
+        });
+
+        if (!osRes.ok) {
+          const errBody = await osRes.text().catch(() => "unknown");
+          const sanitized = errBody.length > 250 ? errBody.slice(0, 250) : errBody;
+          await adminClient
+            .from("call_outbox")
+            .update({
+              status: "failed",
+              last_error: `OneSignal HTTP ${osRes.status}: ${sanitized}`,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", outboxRow.id);
+          return false;
+        }
+
+        await adminClient
+          .from("call_outbox")
+          .update({
+            status: "dispatched",
+            dispatched_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", outboxRow.id);
+        return true;
+      }
+
+      return false;
+    } catch (e: unknown) {
+      console.error(`[send-push] deliverOutboxEvent exception: ${e}`);
+      try {
+        await adminClient
+          .from("call_outbox")
+          .update({
+            status: "failed",
+            last_error: String(e).slice(0, 250),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", outboxRow.id);
+      } catch (_) {}
+      return false;
+    }
+  };
+
+  // Branch 2: Server-Side Scheduled Outbox Worker
+  if (body.action === "process_call_outbox") {
+    const batchSize = typeof body.batch_size === "number" ? Math.min(50, Math.max(1, body.batch_size)) : 10;
+    const workerId = `edge_worker_${callerId.slice(0, 8)}_${Date.now()}`;
+    const { data: claimedEvents, error: claimError } = await adminClient.rpc("claim_call_outbox_events", {
+      p_worker_id: workerId,
+      p_batch_size: batchSize,
+      p_lease_duration_seconds: 30,
+    });
+
+    if (claimError) {
+      console.error(`[send-push] claim_call_outbox_events error: ${claimError.message}`);
+      return new Response(
+        JSON.stringify({ error: "Failed to claim outbox events", details: claimError.message }),
+        { status: 500, headers: corsHeaders },
+      );
+    }
+
+    const events = Array.isArray(claimedEvents) ? claimedEvents : [];
+    let dispatchedCount = 0;
+    for (const evt of events) {
+      const ok = await deliverOutboxEvent(evt);
+      if (ok) dispatchedCount++;
+    }
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        action: "process_call_outbox",
+        claimed_count: events.length,
+        dispatched_count: dispatchedCount,
+      }),
+      { status: 200, headers: corsHeaders },
+    );
+  }
+
+  // Branch 3: Client-Triggered Immediate Dispatch
+  if (body.call_id) {
+    if (typeof body.call_id !== "string" || !UUID_REGEX.test(body.call_id.trim())) {
+      return new Response(
+        JSON.stringify({ error: "Bad Request: valid UUID call_id is required" }),
+        { status: 400, headers: corsHeaders },
+      );
+    }
+    const callId = body.call_id.trim();
+
+    // Verify caller authorization for this call
+    const { data: callCheck, error: callCheckError } = await adminClient
+      .from("calls")
+      .select("id, caller_id")
+      .eq("id", callId)
+      .maybeSingle();
+
+    if (callCheckError || !callCheck) {
+      return new Response(
+        JSON.stringify({ error: "Forbidden: call not found or access denied" }),
+        { status: 403, headers: corsHeaders },
+      );
+    }
+
+    // Verify caller is caller or active participant
+    if (callCheck.caller_id !== callerId) {
+      const { data: partCheck } = await adminClient
+        .from("call_participants")
+        .select("id")
+        .eq("call_id", callId)
+        .eq("user_id", callerId)
+        .maybeSingle();
+
+      if (!partCheck) {
+        return new Response(
+          JSON.stringify({ error: "Forbidden: caller is not a participant in this call" }),
+          { status: 403, headers: corsHeaders },
+        );
+      }
+    }
+
+    // Find pending or lease-expired outbox events for this call
+    const nowIso = new Date().toISOString();
+    const { data: outboxRows } = await adminClient
+      .from("call_outbox")
+      .select("*")
+      .eq("call_id", callId)
+      .or(`status.eq.pending,and(status.eq.processing,locked_until.lt.${nowIso})`)
+      .order("created_at", { ascending: false })
+      .limit(5);
+
+    if (!outboxRows || outboxRows.length === 0) {
+      // Check if already dispatched
+      const { data: existingDispatched } = await adminClient
+        .from("call_outbox")
+        .select("id, status")
+        .eq("call_id", callId)
+        .eq("status", "dispatched")
+        .limit(1);
+
+      if (existingDispatched && existingDispatched.length > 0) {
+        return new Response(
+          JSON.stringify({ success: true, reason: "already_dispatched", dispatched_count: 0 }),
+          { status: 200, headers: corsHeaders },
+        );
+      }
+
+      // Check if active unexpired lease is currently held by worker
+      const { data: activeLease } = await adminClient
+        .from("call_outbox")
+        .select("id, status, locked_until")
+        .eq("call_id", callId)
+        .eq("status", "processing")
+        .gte("locked_until", nowIso)
+        .limit(1);
+
+      if (activeLease && activeLease.length > 0) {
+        return new Response(
+          JSON.stringify({ success: true, reason: "in_progress_by_worker", dispatched_count: 0 }),
+          { status: 200, headers: corsHeaders },
+        );
+      }
+
+      return new Response(
+        JSON.stringify({ success: true, reason: "no_pending_events", dispatched_count: 0 }),
+        { status: 200, headers: corsHeaders },
+      );
+    }
+
+    let dispatchedCount = 0;
+    for (const outboxRow of outboxRows) {
+      // Enforce authoritative max_retries without hardcoding
+      const maxRetries = typeof outboxRow.max_retries === "number" ? outboxRow.max_retries : 3;
+      const currentRetry = typeof outboxRow.retry_count === "number" ? outboxRow.retry_count : 0;
+      if (currentRetry >= maxRetries) {
+        continue;
+      }
+
+      // Acquire 30s lease via atomic conditional update
+      const claimNowIso = new Date().toISOString();
+      const leaseExpiry = new Date(Date.now() + 30000).toISOString();
+
+      const { data: claimedData, error: claimError } = await adminClient
+        .from("call_outbox")
+        .update({
+          status: "processing",
+          locked_by: `client_${callerId.slice(0, 8)}`,
+          locked_until: leaseExpiry,
+          retry_count: currentRetry + 1,
+          updated_at: claimNowIso,
+        })
+        .eq("id", outboxRow.id)
+        .or(`status.eq.pending,and(status.eq.processing,locked_until.lt.${claimNowIso})`)
+        .select();
+
+      if (claimError) {
+        console.error(`[send-push] Atomic lease claim error for outbox event ${outboxRow.id}: ${claimError.message}`);
+        continue;
+      }
+
+      const claimedRows = Array.isArray(claimedData) ? claimedData : [];
+      if (claimedRows.length === 0) {
+        // Lost race to a concurrent worker or another client; skip to prevent duplicate dispatch
+        continue;
+      }
+
+      const claimedRow = claimedRows[0];
+      const ok = await deliverOutboxEvent(claimedRow);
+      if (ok) dispatchedCount++;
+    }
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        call_id: callId,
+        dispatched_count: dispatchedCount,
+      }),
+      { status: 200, headers: corsHeaders },
+    );
+  }
+
+  return new Response(
+    JSON.stringify({ error: "Bad Request: invalid calling dispatch payload" }),
+    { status: 400, headers: corsHeaders },
+  );
 }
 
 export async function handler(req: Request, deps?: HandlerDeps): Promise<Response> {
@@ -258,7 +711,43 @@ export async function handler(req: Request, deps?: HandlerDeps): Promise<Respons
       }
     }
 
-    // 1. Authenticate caller via JWT
+    // 1. Parse and validate JSON payload early
+    const body = await req.json().catch(() => null);
+    if (!body || typeof body !== "object") {
+      return new Response(
+        JSON.stringify({ error: "Bad Request: JSON body required" }),
+        { status: 400, headers: corsHeaders }
+      );
+    }
+
+    // 2. Worker-Only Action Authentication (Protected by CALL_WORKER_SECRET)
+    const isWorkerAction = body.action === "process_call_outbox" || body.action === "process_call_timeouts";
+    if (isWorkerAction) {
+      const configuredWorkerSecret = Deno.env.get("CALL_WORKER_SECRET") ?? deps?.callWorkerSecret;
+      const providedSecret = req.headers.get("x-call-worker-secret")?.trim() ||
+        (req.headers.get("Authorization")?.startsWith("Bearer ") ? req.headers.get("Authorization")?.replace("Bearer ", "").trim() : null);
+
+      if (!configuredWorkerSecret || !providedSecret || providedSecret !== configuredWorkerSecret) {
+        console.warn("[send-push] Unauthorized worker action attempt: invalid or missing CALL_WORKER_SECRET");
+        return new Response(
+          JSON.stringify({ error: "Forbidden: invalid or missing worker secret" }),
+          { status: 403, headers: corsHeaders }
+        );
+      }
+
+      // Worker secret validated. Use internal service_role client to execute worker RPCs
+      const adminClient = deps?.adminClient ?? createClient(supabaseUrl!, supabaseServiceRoleKey!);
+      return await handleCallPush({
+        body,
+        callerId: "worker_daemon",
+        adminClient,
+        onesignalAppId,
+        onesignalRestKey,
+        fetcher: deps?.fetcher ?? fetch,
+      });
+    }
+
+    // 3. User Authentication via Supabase JWT (Strictly Required for All Client Operations)
     const authHeader = req.headers.get("Authorization");
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
       return new Response(
@@ -287,10 +776,10 @@ export async function handler(req: Request, deps?: HandlerDeps): Promise<Respons
 
     const callerId = user.id;
 
-    // 2. Elevated Service Client for Rate Limiting & Admin Queries
+    // 4. Elevated Service Client for Rate Limiting & Admin Queries
     const adminClient = deps?.adminClient ?? createClient(supabaseUrl!, supabaseServiceRoleKey!);
 
-    // 3. Abuse Rate Limiting (Server-Controlled Distributed Atomic RPC)
+    // 5. Abuse Rate Limiting (Server-Controlled Distributed Atomic RPC)
     const rateLimitFn = deps?.rateLimiter ?? checkRateLimitRpc;
     const rateLimit = await rateLimitFn(adminClient, callerId);
 
@@ -319,13 +808,16 @@ export async function handler(req: Request, deps?: HandlerDeps): Promise<Respons
       );
     }
 
-    // 4. Parse and validate payload
-    const body = await req.json().catch(() => null);
-    if (!body || typeof body !== "object") {
-      return new Response(
-        JSON.stringify({ error: "Bad Request: JSON body required" }),
-        { status: 400, headers: corsHeaders }
-      );
+    // 6. Branch to Client-Triggered Call Push Dispatcher
+    if (body.call_id) {
+      return await handleCallPush({
+        body,
+        callerId,
+        adminClient,
+        onesignalAppId,
+        onesignalRestKey,
+        fetcher: deps?.fetcher ?? fetch,
+      });
     }
 
     const { chat_id, message_id } = body;

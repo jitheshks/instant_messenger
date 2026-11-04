@@ -9,7 +9,7 @@ plugins {
 
 android {
     namespace = "com.example.instant_messenger"
-    compileSdk = 36
+    compileSdk = 37
     ndkVersion = flutter.ndkVersion
 
     compileOptions {

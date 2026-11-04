@@ -112,11 +112,6 @@
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
 
-        <!-- OneSignal: prevent auto-launch on notification tap -->
-        <meta-data
-            android:name="com.onesignal.NotificationOpened.DEFAULT"
-            android:value="DISABLE" />
-
         <!-- OneSignal: prevent auto-opening URLs/deep links -->
         <meta-data
             android:name="com.onesignal.suppressLaunchURLs"

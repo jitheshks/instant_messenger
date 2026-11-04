@@ -43,7 +43,19 @@
 	</array>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+	</array>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Instant Messenger requires camera access to capture photos and videos for messages and profile avatars.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Instant Messenger requires microphone access to record voice messages.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Instant Messenger requires access to your photo library to select and send media.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>Instant Messenger uses your contacts to find friends who are already on the platform.</string>
 </dict>
 </plist>

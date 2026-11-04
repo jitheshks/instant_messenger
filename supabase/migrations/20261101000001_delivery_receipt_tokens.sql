@@ -48,6 +48,11 @@ grant all on public.message_delivery_receipt_tokens to service_role;
 -- 5. Authorship boundary: sender cannot acknowledge their own message (m.sender_id != caller).
 -- 6. Monotonic progression: only advances messages where status < 2 (delivered).
 -- 7. Read protection: NEVER marks messages as read (status 3).
+-- 8. Chat-level synchronization: ties last_message_status update strictly to
+--    successful message update / authorization and chat membership.
+-- 9. Authorization enforcement: if message update affects 0 rows, verifies
+--    whether the message is already delivered/read under valid authorization;
+--    failed authorization (e.g. removed member) returns false and suppresses chat update.
 create or replace function public.acknowledge_delivery_token(
   p_message_id uuid,
   p_receipt_token text
@@ -103,18 +108,43 @@ begin
   )
   select count(*) into v_updated_count from updated_rows;
 
-  -- 5. Synchronize chat-level last_message_status if the message is the latest in chat
+  -- 5. Authorization & idempotency validation if zero rows were updated
+  if v_updated_count = 0 then
+    -- Verify whether the message is already in delivered (2) or read (3) status
+    -- under strictly verified chat membership, direct chat type, and sender authorship.
+    select count(*) into v_updated_count
+    from public.messages m
+    join public.chats c on m.chat_id = c.id
+    where m.id = p_message_id
+      and c.type = 'direct'
+      and m.sender_id != v_caller_id
+      and m.status >= 2
+      and public.is_chat_member(c.id);
+
+    -- If authorization failed (e.g. recipient removed from chat, caller is sender,
+    -- chat not direct, or non-existent message), exit with false and suppress chat update.
+    if v_updated_count = 0 then
+      return false;
+    end if;
+  end if;
+
+  -- 6. Synchronize chat-level last_message_status if the message is the latest in chat
+  -- Authorized membership is guaranteed (v_updated_count > 0).
+  -- Only sets last_message_status = 2 if the message is actually at status 2 (delivered),
+  -- preventing chat-level regression when the message has already reached status 3 (read).
   update public.chats c
   set last_message_status = 2,
       updated_at = pg_catalog.clock_timestamp()
   where c.type = 'direct'
     and c.last_sender_id != v_caller_id
     and c.last_message_status < 2
+    and public.is_chat_member(c.id)
     and exists (
       select 1 from public.messages m
       where m.chat_id = c.id
         and m.id = p_message_id
         and m.sent_at = c.last_message_time
+        and m.status = 2
     );
 
   return true;

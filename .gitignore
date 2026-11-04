@@ -47,11 +47,16 @@ app.*.map.json
 # Environment variables
 .env
 .env.*
+!.env.example
 
 # Firebase local state
 .firebase/
 firebase-debug.log
 firestore-debug.log
 
+# Supabase CLI local cache and data backups
+supabase/.temp/
+supabase/.branches/
+supabase/pre_calling_data_backup.sql
 
 lib/firebase_options.dart
