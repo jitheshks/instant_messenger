@@ -50,11 +50,15 @@ service cloud.firestore {
          Path: /users/{uid}/chats/{chatId}
       ------------------------- */
       match /chats/{chatId} {
-        // Needed for list, orderBy, realtime updates
-        allow read: if signedIn();
+        // 🔒 Only the inbox owner can read their own inbox summaries
+        allow read: if signedIn() && request.auth.uid == uid;
 
-        // Needed for batch updates & deletes
-        allow write: if signedIn();
+        // 🔒 Only inbox owner can delete; creation/update allowed by owner or verified chat members
+        allow create, update: if signedIn() && (
+          request.auth.uid == uid ||
+          isMember(chatId)
+        );
+        allow delete: if signedIn() && request.auth.uid == uid;
       }
     }
 

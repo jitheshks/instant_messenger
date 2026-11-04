@@ -40,13 +40,13 @@
         android:name="${applicationName}"
         android:icon="@mipmap/launcher_icon">
 
-
-
-        <!-- WorkManager background worker -->
-        <service
-            android:name="be.tramckrijte.workmanager.BackgroundWorker"
-            android:permission="android.permission.BIND_JOB_SERVICE"
-            android:exported="false" />
+        <!-- FCM Default Notification Channel & Icon -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_channel_id"
+            android:value="chat_messages" />
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_icon"
+            android:resource="@mipmap/launcher_icon" />
 
         <!-- Flutter Local Notifications foreground service -->
         <service
@@ -112,16 +112,15 @@
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
 
-        <!-- OneSignal: prevent auto-launch on notification tap -->
-        <meta-data
-            android:name="com.onesignal.NotificationOpened.DEFAULT"
-            android:value="DISABLE" />
-
-        
         <!-- OneSignal: prevent auto-opening URLs/deep links -->
         <meta-data
             android:name="com.onesignal.suppressLaunchURLs"
             android:value="true" />
+
+        <!-- OneSignal Native Notification Service Extension (Background / Terminated Delivery Receipts) -->
+        <meta-data
+            android:name="com.onesignal.NotificationServiceExtension"
+            android:value="com.example.instant_messenger.InstantMessengerNotificationExtension" />
             
         <meta-data
             android:name="flutterEmbedding"
